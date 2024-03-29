@@ -30,6 +30,8 @@
 #include <set>
 #include <string>
 
+#include "hlib.h"
+
 #define PLUGINFILTER L"*.asi"
 #define PLUGINDIR L"plugins\\"
 
@@ -41,83 +43,123 @@
 	ExitProcess(0);\
 }
 
+// Function pointer to the InitAsi function
+// The InitAsi function is a function that is called to let the plugin initialize itself outside of the loader lock dllmain
+typedef void(*InitAsiCall)();
+std::vector<InitAsiCall> initialise_vectors{};
+
 // Load the plugins
 DWORD __stdcall AsiLoad(HMODULE hModule) {
-	// Get the directory of the exe
-	HMODULE main = GetModuleHandle(NULL);
-	if (main == NULL)
-		ERROR_BOX(L"Cannot get module handle of your exe.");
-	wchar_t filename[MAX_PATH + 1 + _countof(PLUGINDIR PLUGINFILTER)];
-	auto len = GetModuleFileName(main, filename, MAX_PATH);
-	if (len <= 0)
-		ERROR_BOX(L"Cannot get file name of your exe.");
-	// find where the directory ends (i.e. where the exe name begins)
-	filename[len] = L'\0';
-	for (--len; len >= 0; len--) {
-		if (filename[len] == L'\\') {
-			filename[++len] = L'\0';
-			break;
-		}
-	}
-	// change directory to PLUGINDIR and add PLUGINFILTER
-	memcpy(&(filename[len]), PLUGINDIR PLUGINFILTER, sizeof(PLUGINDIR PLUGINFILTER));
-	len += _countof(PLUGINDIR) - 1; // len of the fully qualified plugin dir
-	auto remainingLen = _countof(filename) - len;
-	auto pluginname = &(filename[len]);
-	std::set<std::wstring> plugins;
-	WIN32_FIND_DATA ffd;
-	HANDLE hFind;
-	hFind = FindFirstFile(filename, &ffd);
-	if (hFind != INVALID_HANDLE_VALUE) {
-		do {
-			if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-				continue;
-			// Due to some DOS compatibility FindFirstFile does match *.asi*.
-			// So we use this to match to *.asi only.
-			if (!PathMatchSpec(ffd.cFileName, PLUGINFILTER))
-				continue;
-			plugins.emplace(ffd.cFileName);
-		} while (FindNextFile(hFind, &ffd) != 0);
-		FindClose(hFind);
-		
-		// iterates the plugins alphabetically to load them in a predictable order
-		for (auto& plugin : plugins) {
-			wcscpy_s(pluginname, remainingLen, plugin.c_str()); // make it a fully qualified name
-			HMODULE hMod = LoadLibrary(filename);
-			if (!hMod) {
-				const TCHAR fmt[] = L"Cannot load plugin\n%s" L"\n\nError Code %d.";
-				TCHAR buf[sizeof(fmt) + MAX_PATH + 32];
-				swprintf_s(buf, fmt, filename, (DWORD)GetLastError());
-				MessageBox(NULL, buf, L"ASI LOADER ERROR", MB_ICONEXCLAMATION | MB_OK | MB_TOPMOST | MB_SETFOREGROUND);
-			}
-		}
-	} 
+    // Get the directory of the exe
+    HMODULE main = GetModuleHandle(NULL);
+    if (main == NULL)
+        ERROR_BOX(L"Cannot get module handle of your exe.");
 
-	if (hModule) {
-		FreeLibraryAndExitThread(hModule, 0);
-	}
-	return 0;
+    wchar_t filename[MAX_PATH + 1 + _countof(PLUGINDIR PLUGINFILTER)];
+    auto len = GetModuleFileName(main, filename, MAX_PATH);
+    if (len <= 0)
+        ERROR_BOX(L"Cannot get file name of your exe.");
+
+    // find where the directory ends (i.e. where the exe name begins)
+    filename[len] = L'\0';
+    for (--len; len >= 0; len--) {
+        if (filename[len] == L'\\') {
+            filename[++len] = L'\0';
+            break;
+        }
+    }
+    // change directory to PLUGINDIR and add PLUGINFILTER
+    memcpy(&(filename[len]), PLUGINDIR PLUGINFILTER, sizeof(PLUGINDIR PLUGINFILTER));
+    len += _countof(PLUGINDIR) - 1; // len of the fully qualified plugin dir
+    auto remainingLen = _countof(filename) - len;
+    auto pluginname = &(filename[len]);
+    std::set<std::wstring> plugins;
+    WIN32_FIND_DATA ffd;
+    HANDLE hFind;
+    hFind = FindFirstFile(filename, &ffd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                continue;
+            // Due to some DOS compatibility FindFirstFile does match *.asi*.
+            // So we use this to match to *.asi only.
+            if (!PathMatchSpec(ffd.cFileName, PLUGINFILTER))
+                continue;
+            plugins.emplace(ffd.cFileName);
+        } while (FindNextFile(hFind, &ffd) != 0);
+        FindClose(hFind);
+
+        // iterates the plugins alphabetically to load them in a predictable order
+        for (auto& plugin : plugins) {
+            wcscpy_s(pluginname, remainingLen, plugin.c_str()); // make it a fully qualified name
+            HMODULE hMod = LoadLibrary(filename);
+            if (!hMod) {
+                const TCHAR fmt[] = L"Cannot load plugin\n%s" L"\n\nError Code %d.";
+                TCHAR buf[sizeof(fmt) + MAX_PATH + 32];
+                swprintf_s(buf, fmt, filename, (DWORD)GetLastError());
+                MessageBox(nullptr, buf, L"ASI LOADER ERROR", MB_ICONEXCLAMATION | MB_OK | MB_TOPMOST | MB_SETFOREGROUND);
+            } else {
+                auto init = reinterpret_cast<InitAsiCall>(GetProcAddress(hMod, "InitAsi"));
+                if (init) 
+                    initialise_vectors.push_back(init);
+            }
+        }
+    }
+
+    if (hModule) {
+        FreeLibraryAndExitThread(hModule, 0);
+    }
+    return 0;
+}
+
+HANDLE loader_init_thread_handle = nullptr;
+
+static char WaitForPlugins() {
+    if (loader_init_thread_handle != nullptr) {
+        WaitForSingleObject(loader_init_thread_handle, INFINITE);
+        loader_init_thread_handle = nullptr;
+    } else {
+        MessageBoxA(nullptr, "NetModAPI - Error", "NetModAPI - Error", MB_OK);
+    }
+
+    // Iterate all the plugins and call the InitASI function
+    for (const InitAsiCall init : initialise_vectors) {
+        init();
+    }
+
+    return 1;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
-	if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
-		// We try to avoid loading the plugins from DllMain. In the DllMain we may
-		// only expect kernel32 imports to be resolved. Furthermore we are in a loader
-		// lock. We therefore try to create a new thread to load all the plugins. 
-		// We increase the ref count of our module to prevent unloading of our dll
-		// while the thread is still running. The system starts the thread only when 
-		// all imports are mapped. So we can use User32.dll etc
-		// Note that we must use FreeLibraryAndExitThread to prevent the unload/exit
-		// race condition
-		HMODULE mod;
-		if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)AsiLoad, &mod)) {
-			auto h = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)AsiLoad, hModule, 0, NULL);
-			if (h) CloseHandle(h);
-			else { AsiLoad(NULL); FreeLibrary(mod); }
-		}
-		else {
-			AsiLoad(NULL);
-		}
-	}
-	return TRUE;
+    if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+        // We try to avoid loading the plugins from DllMain. In the DllMain we may
+        // only expect kernel32 imports to be resolved. Furthermore we are in a loader
+        // lock. We therefore try to create a new thread to load all the plugins. 
+        // We increase the ref count of our module to prevent unloading of our dll
+        // while the thread is still running. The system starts the thread only when 
+        // all imports are mapped. So we can use User32.dll etc
+        // Note that we must use FreeLibraryAndExitThread to prevent the unload/exit
+        // race condition
+
+
+        // Add a hook to the main function to wait for the plugins to be loaded
+        // This hook is outside the loader lock, right before any larger initializations
+        const DWORD S4_Main = reinterpret_cast<DWORD>(GetModuleHandle(nullptr));
+        hlib::CallPatch patch = hlib::CallPatch(S4_Main + 0x5C489, reinterpret_cast<DWORD>(&WaitForPlugins));
+        patch.patch();
+
+        HMODULE mod;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(AsiLoad), &mod)) {
+            loader_init_thread_handle = CreateThread(nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(AsiLoad), hModule, 0, nullptr);
+            if (loader_init_thread_handle != nullptr)
+                CloseHandle(loader_init_thread_handle);
+            else {
+                AsiLoad(nullptr);
+                FreeLibrary(mod);
+            }
+        } else {
+            AsiLoad(nullptr);
+        }
+    }
+    return TRUE;
 }
