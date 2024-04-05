@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <shlwapi.h>
 #include <set>
+#include <format>
 #include <string>
 
 #include "hlib.h"
@@ -100,26 +101,31 @@ DWORD __stdcall AsiLoad(HMODULE hModule) {
                 MessageBox(nullptr, buf, L"ASI LOADER ERROR", MB_ICONEXCLAMATION | MB_OK | MB_TOPMOST | MB_SETFOREGROUND);
             } else {
                 auto init = reinterpret_cast<InitAsiCall>(GetProcAddress(hMod, "InitAsi"));
-                if (init) 
+                if (init)
                     initialise_vectors.push_back(init);
             }
         }
     }
 
-    if (hModule) {
-        FreeLibraryAndExitThread(hModule, 0);
-    }
     return 0;
 }
 
+
 HANDLE loader_init_thread_handle = nullptr;
+bool loader_init_thread_running = false;
 
 static char WaitForPlugins() {
     if (loader_init_thread_handle != nullptr) {
-        WaitForSingleObject(loader_init_thread_handle, INFINITE);
+        auto status = WaitForSingleObject(loader_init_thread_handle, INFINITE);
+        
+        if (status != WAIT_OBJECT_0) {
+            std::string msg = "Failed to wait for asi loader thread (status code: "+std::format("{:x}",status)+"): " + std::to_string(GetLastError());
+            MessageBoxA(nullptr, msg.c_str(), "ASI Loader - Error", MB_OK);
+        }
+
         loader_init_thread_handle = nullptr;
     } else {
-        MessageBoxA(nullptr, "NetModAPI - Error", "NetModAPI - Error", MB_OK);
+        MessageBoxA(nullptr, "asi loader thread failed to correctly initialize", "ASI Loader - Error", MB_OK);
     }
 
     // Iterate all the plugins and call the InitASI function
@@ -146,14 +152,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         // This hook is outside the loader lock, right before any larger initializations
         const DWORD S4_Main = reinterpret_cast<DWORD>(GetModuleHandle(nullptr));
         hlib::CallPatch patch = hlib::CallPatch(S4_Main + 0x5C489, reinterpret_cast<DWORD>(&WaitForPlugins));
-        patch.patch();
+
+        const auto result = patch.patch();
+        if (!result) {
+            MessageBoxA(nullptr, "Failed to patch the main function", "ASI Loader - Error", MB_OK);
+        }
 
         HMODULE mod;
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, reinterpret_cast<LPCWSTR>(AsiLoad), &mod)) {
             loader_init_thread_handle = CreateThread(nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(AsiLoad), hModule, 0, nullptr);
-            if (loader_init_thread_handle != nullptr)
-                CloseHandle(loader_init_thread_handle);
-            else {
+            if (loader_init_thread_handle == nullptr) {
                 AsiLoad(nullptr);
                 FreeLibrary(mod);
             }
